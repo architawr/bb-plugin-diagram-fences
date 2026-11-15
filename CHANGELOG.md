@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 — 2026-11-15
+
+- Marketplace release. The overview now describes per-engine install and custom
+  paths, the two-process cap, and D2 installed from settings.
+
 ## 0.2.0 — 2026-11-15
 
 - Settings screen rebuilt: one card per engine with its resolved path and

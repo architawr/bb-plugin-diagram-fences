@@ -7,26 +7,31 @@ you read them.
 
 ## Where it renders
 
-- Assistant replies: a ```` ```plantuml ````, ```` ```dot ```` or ```` ```d2 ````
-  block becomes a diagram with a source toggle, copy, and open-in-tab controls.
+- Assistant replies: a `plantuml`, `dot` or `d2` block becomes a diagram with a
+  source toggle, copy, and open-in-tab controls.
 - Markdown file previews: the same blocks draw in the right panel, where BB's
   code-fence slot does not reach. A content script swaps the code block for the
   diagram and leaves the file untouched.
 
-## Local first
+## Local engines
 
-Drawing does not have to leave the machine, and nothing has to be started:
+Settings lists each engine with the binary it resolved, its origin, and its own
+buttons:
 
-- Graphviz uses `dot` when it is installed and falls back to a bundled WASM
-  build, so boxes-and-arrows always work offline.
-- PlantUML uses the official native binary — no Java, no server. The plugin
-  downloads it once (~54 MB) the first time a PlantUML fence needs it, and
-  renders in about 0.2 s after that.
-- D2 uses the `d2` binary when it is on `PATH`.
-- Everything else goes to Kroki, public or your own instance.
+- Graphviz uses `dot` when it is installed and a bundled WASM build otherwise,
+  so boxes-and-arrows always work offline.
+- PlantUML is the official native binary, downloaded from the settings screen
+  or on first use — no Java, no server. It draws in about 0.2 s.
+- D2 is the official binary, installed the same way; Kroki covers it until then.
+- A custom path can point any engine at a binary you already have.
 
-Each engine runs per diagram and exits. Diagrams are cached by content hash, so
-switching threads, reloading, or opening the same file again costs nothing.
+Everything else goes to Kroki, public or your own instance.
+
+## Cost
+
+Each engine runs per diagram and exits; at most two run at a time. Diagrams are
+cached by content hash, and a preview draws only the fences near the viewport,
+so scrolling a long file or switching threads costs nothing.
 
 ## Modes
 
@@ -37,5 +42,5 @@ the hosted cases, including a self-hosted Kroki for private diagrams.
 ## Safety
 
 Rendered SVG is shown through an `<img>` blob, so a diagram cannot run script in
-the bb page. Local files are written only inside the plugin's own data
-directory. The preview route accepts BB app origins with JSON bodies only.
+the bb page. Files are written only inside the plugin's own data directory, and
+diagram source reaches kroki.io only in the modes that name it.
