@@ -17,7 +17,9 @@ Mermaid is not claimed; BB already draws it.
 - Each diagram carries the fence language and the engine that drew it, a source
   toggle, copy, and open-in-a-new-tab.
 - In a Markdown file preview the code block is replaced by the diagram (the
-  code-fence slot does not reach previews, so a content script does it).
+  code-fence slot does not reach previews, so a content script does it). This
+  needs BB's built-in preview: if another plugin opens `.md` files, set
+  `.md` to Built-in preview under Settings → Files → File openers.
 - A broken diagram shows the error and BB's own code block; nothing is hidden.
 
 ## Settings
