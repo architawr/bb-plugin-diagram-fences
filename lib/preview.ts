@@ -113,13 +113,11 @@ export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () 
     // BB wraps a fence in a card (language label, copy, then <pre>). Replace the
     // whole card when it looks like one, otherwise just follow the <pre>.
     const parent = pre.parentElement;
-    const card =
+    const looksLikeCard =
       parent !== null &&
-      parent !== document.body &&
-      parent.querySelectorAll("pre").length === 1 &&
-      parent.children.length <= 4
-        ? parent
-        : null;
+      (parent.className.includes("rounded") || parent.className.includes("border"));
+    const card =
+      parent !== null && looksLikeCard && parent.children.length <= 4 ? parent : null;
     const host = card ?? pre;
 
     const existing = host.nextElementSibling;
