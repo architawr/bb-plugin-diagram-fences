@@ -32,11 +32,14 @@ code block stays.
 - `kroki` — the public kroki.io service.
 - `custom` — your own Kroki URL.
 
-Local engines: `dot` if installed, otherwise the bundled Graphviz WASM;
-PlantUML as `plantuml` on `PATH` or a native binary the plugin downloads to
-`<dataDir>/plugins/diagram-fences/engines/` (~54 MB, no Java needed); `d2` only
-when the `d2` binary is installed. D2 and the Kroki-only languages use Kroki
-unless it is installed locally or mode is `local`.
+Local engines are resolved per engine: a custom path from settings, then a
+binary the plugin installed under
+`<dataDir>/plugins/diagram-fences/engines/`, then the binary on `PATH`.
+Graphviz falls back to a bundled WASM renderer. Settings → Diagram engines has
+**Install**, **Use my own binary…**, **Test** and **Remove** for each engine,
+and `autoDownload` (on by default) fetches a missing PlantUML (~54 MB) or D2
+(~17 MB) build on the first diagram that needs it. Kroki-only languages always
+use Kroki.
 
 ## Rules for authors
 

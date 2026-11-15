@@ -2,7 +2,7 @@
 //
 // Draws fenced PlantUML, Graphviz/dot, D2 and the rest of the Kroki family in
 // assistant replies (and, through the content script in app.tsx, in Markdown
-// file previews). Three rendering routes, picked in Settings:
+// file previews). Four rendering routes, picked in Settings:
 //
 //   auto   — a local engine when this machine has one, kroki.io otherwise
 //   local  — only this machine; an unsupported language is an error, and so is
@@ -11,9 +11,10 @@
 //   custom — a self-hosted Kroki (or any compatible gateway)
 //
 // Local engines never stay running: graphviz is either `dot` spawned per
-// diagram or a lazily created WASM instance, PlantUML is a native binary that
-// exits after one render, and D2 uses the `d2` binary when it is installed.
-// Every SVG is cached by content hash, so a diagram is drawn once per machine.
+// diagram or a lazily created WASM instance, PlantUML and D2 are native
+// binaries that exit after one render. Every engine can be installed from the
+// settings screen or pointed at a binary the user already has. Every SVG is
+// cached by content hash, so a diagram is drawn once per machine.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -29,13 +30,23 @@ import {
 } from "./lib/languages";
 
 const PLANTUML_VERSION = "1.2026.10";
+const D2_VERSION = "0.9.0";
 
 /** PlantUML publishes native (GraalVM) builds — no Java runtime needed. */
-const NATIVE_ASSETS: Record<string, string> = {
+const PLANTUML_ASSETS: Record<string, string> = {
   "darwin-arm64": "native-plantuml-macos-arm64",
   "linux-x64": "native-plantuml-linux-amd64",
   "linux-arm64": "native-plantuml-linux-arm64",
   "win32-x64": "native-plantuml-windows-amd64",
+};
+
+const D2_ASSETS: Record<string, string> = {
+  "darwin-arm64": "macos-arm64",
+  "darwin-x64": "macos-amd64",
+  "linux-x64": "linux-amd64",
+  "linux-arm64": "linux-arm64",
+  "win32-x64": "windows-amd64",
+  "win32-arm64": "windows-arm64",
 };
 
 const MAX_OUTPUT_BYTES = 12 * 1024 * 1024;
@@ -45,6 +56,22 @@ const KROKI_TIMEOUT_MS = 20_000;
 const ENGINE_READY = "engine-ready";
 
 const themeSchema = z.enum(["light", "dark"]);
+const engineIdSchema = z.enum(["graphviz", "plantuml", "d2"]);
+
+type EngineId = z.infer<typeof engineIdSchema>;
+type Theme = z.infer<typeof themeSchema>;
+
+const ENGINE_LABELS: Record<EngineId, string> = {
+  graphviz: "Graphviz",
+  plantuml: "PlantUML",
+  d2: "D2",
+};
+
+const ENGINE_SETTING_KEYS: Record<EngineId, "graphvizPath" | "plantumlPath" | "d2Path"> = {
+  graphviz: "graphvizPath",
+  plantuml: "plantumlPath",
+  d2: "d2Path",
+};
 
 export const rpcContract = defineRpcContract({
   render: {
@@ -70,25 +97,47 @@ export const rpcContract = defineRpcContract({
       cacheEntries: z.number(),
       engines: z.array(
         z.object({
-          id: z.string(),
+          id: engineIdSchema,
           label: z.string(),
           available: z.boolean(),
           detail: z.string(),
+          source: z.string().nullable(),
+          path: z.string().nullable(),
+          canInstall: z.boolean(),
+          canRemove: z.boolean(),
+          downloading: z.boolean(),
+          custom: z.string(),
         }),
       ),
     }),
   },
-  download_plantuml: {
-    input: z.null(),
+  engine_install: {
+    input: z.object({ engine: engineIdSchema }).strict(),
     output: z.object({ started: z.boolean(), path: z.string().nullable() }),
+  },
+  engine_remove: {
+    input: z.object({ engine: engineIdSchema }).strict(),
+    output: z.object({ removed: z.boolean() }),
+  },
+  engine_set_path: {
+    input: z
+      .object({ engine: engineIdSchema, path: z.string().max(4096) })
+      .strict(),
+    output: z.object({ path: z.string().nullable() }),
+  },
+  engine_test: {
+    input: z.object({ engine: engineIdSchema }).strict(),
+    output: z.object({
+      ok: z.boolean(),
+      svg: z.string().optional(),
+      error: z.string().optional(),
+    }),
   },
   clear_cache: {
     input: z.null(),
     output: z.object({ removed: z.number() }),
   },
 });
-
-type Theme = z.infer<typeof themeSchema>;
 
 interface RenderRequest {
   language: string;
@@ -215,9 +264,15 @@ function describeKrokiError(body: string): string {
   return text.slice(0, 300) || "the diagram could not be parsed";
 }
 
-interface CachedDiagram {
-  svg: string;
-  engine: string;
+interface EngineState {
+  id: EngineId;
+  available: boolean;
+  detail: string;
+  source: "custom" | "downloaded" | "path" | "bundled" | null;
+  path: string | null;
+  canInstall: boolean;
+  canRemove: boolean;
+  downloading: boolean;
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -241,10 +296,25 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Kroki URL (used by Custom mode)",
       default: "https://kroki.io",
     },
-    downloadPlantUml: {
+    autoDownload: {
       type: "boolean",
-      label: "Download the PlantUML engine when a diagram needs it",
+      label: "Download a missing local engine when a diagram needs it",
       default: true,
+    },
+    graphvizPath: {
+      type: "string",
+      label: "Custom dot binary (optional, overrides the lookup)",
+      default: "",
+    },
+    plantumlPath: {
+      type: "string",
+      label: "Custom PlantUML binary (optional, overrides the lookup)",
+      default: "",
+    },
+    d2Path: {
+      type: "string",
+      label: "Custom d2 binary (optional, overrides the lookup)",
+      default: "",
     },
     cacheEntries: {
       type: "number",
@@ -287,7 +357,7 @@ export default async function plugin(bb: BbPluginApi) {
   );
   const clearCached = db.prepare("delete from diagram_cache");
 
-  function cacheLookup(hash: string): CachedDiagram | null {
+  function cacheLookup(hash: string): { svg: string; engine: string } | null {
     const row = readCached.get(hash) as { svg: string; engine: string } | undefined;
     if (!row) return null;
     touchCached.run(Date.now(), hash);
@@ -306,16 +376,248 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       mode: values.mode,
       krokiUrl: values.krokiUrl.trim() || "https://kroki.io",
-      downloadPlantUml: values.downloadPlantUml,
+      autoDownload: values.autoDownload,
+      graphvizPath: values.graphvizPath.trim(),
+      plantumlPath: values.plantumlPath.trim(),
+      d2Path: values.d2Path.trim(),
       cacheEntries: values.cacheEntries,
       maxSourceKb: values.maxSourceKb,
     };
   }
+  type Config = Awaited<ReturnType<typeof effective>>;
 
-  // ---------------------------------------------------------------- engines
+  // ------------------------------------------------------- downloaded engines
 
-  async function renderGraphviz(source: string, theme: Theme): Promise<{ svg: string; engine: string }> {
-    const dot = await findExecutable("dot");
+  function enginesRoot(): string {
+    // <dataDir>/plugins/<id>/ is this plugin's own directory (data.db lives there).
+    return path.join(bb.server.experimental_dataDir, "plugins", bb.pluginId, "engines");
+  }
+
+  function plantumlHome(): string {
+    return path.join(enginesRoot(), `plantuml-${PLANTUML_VERSION}`);
+  }
+
+  function d2Home(): string {
+    return path.join(enginesRoot(), `d2-${D2_VERSION}`);
+  }
+
+  function plantumlBinary(): string | null {
+    const candidate = path.join(
+      plantumlHome(),
+      process.platform === "win32" ? "plantuml.exe" : "plantuml",
+    );
+    return existsSync(candidate) ? candidate : null;
+  }
+
+  function d2Binary(): string | null {
+    const candidate = path.join(
+      d2Home(),
+      `d2-v${D2_VERSION}`,
+      "bin",
+      process.platform === "win32" ? "d2.exe" : "d2",
+    );
+    return existsSync(candidate) ? candidate : null;
+  }
+
+  const downloads = new Map<EngineId, Promise<string | null>>();
+
+  async function extractArchive(
+    archive: string,
+    directory: string,
+    kind: "zip" | "tar.gz",
+  ): Promise<void> {
+    await mkdir(directory, { recursive: true });
+    if (kind === "zip") {
+      try {
+        await runProcess("unzip", ["-o", "-q", archive, "-d", directory], "", 120_000);
+      } catch (cause) {
+        await runProcess("ditto", ["-x", "-k", archive, directory], "", 120_000).catch(() => {
+          throw cause;
+        });
+      }
+      return;
+    }
+    await runProcess("tar", ["-xzf", archive, "-C", directory], "", 120_000);
+  }
+
+  async function fetchArchive(url: string, destination: string): Promise<void> {
+    const response = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(300_000),
+    });
+    if (!response.ok) throw new Error(`download failed: HTTP ${response.status}`);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, Buffer.from(await response.arrayBuffer()));
+  }
+
+  async function downloadPlantuml(): Promise<string | null> {
+    const asset = PLANTUML_ASSETS[`${process.platform}-${process.arch}`];
+    if (!asset) {
+      throw new Error(
+        `PlantUML has no native build for ${process.platform}-${process.arch}; point the custom path at a plantuml binary instead`,
+      );
+    }
+    const home = plantumlHome();
+    const archive = path.join(home, "plantuml.zip");
+    const url = `https://github.com/plantuml/plantuml/releases/download/v${PLANTUML_VERSION}/${asset}-${PLANTUML_VERSION}.zip`;
+    bb.log.info(`downloading PlantUML ${PLANTUML_VERSION} (${asset})`);
+    await fetchArchive(url, archive);
+    await extractArchive(archive, home, "zip");
+    await rm(archive, { force: true });
+    const binary = path.join(
+      home,
+      process.platform === "win32" ? "plantuml.exe" : "plantuml",
+    );
+    await chmod(binary, 0o755);
+    bb.log.info(`PlantUML engine ready at ${binary}`);
+    bb.realtime.publish(ENGINE_READY, { engine: "plantuml" });
+    return binary;
+  }
+
+  async function downloadD2(): Promise<string | null> {
+    const asset = D2_ASSETS[`${process.platform}-${process.arch}`];
+    if (!asset) {
+      throw new Error(
+        `D2 has no build for ${process.platform}-${process.arch}; install d2 yourself and set the custom path`,
+      );
+    }
+    const home = d2Home();
+    const archive = path.join(home, `d2.tar.gz`);
+    const url = `https://github.com/terrastruct/d2/releases/download/v${D2_VERSION}/d2-v${D2_VERSION}-${asset}.tar.gz`;
+    bb.log.info(`downloading D2 ${D2_VERSION} (${asset})`);
+    await fetchArchive(url, archive);
+    await extractArchive(archive, home, "tar.gz");
+    await rm(archive, { force: true });
+    const binary = path.join(
+      home,
+      `d2-v${D2_VERSION}`,
+      "bin",
+      process.platform === "win32" ? "d2.exe" : "d2",
+    );
+    await chmod(binary, 0o755);
+    bb.log.info(`D2 engine ready at ${binary}`);
+    bb.realtime.publish(ENGINE_READY, { engine: "d2" });
+    return binary;
+  }
+
+  function startDownload(engine: EngineId): void {
+    if (engine === "graphviz" || downloads.has(engine)) return;
+    const job = (engine === "plantuml" ? downloadPlantuml() : downloadD2())
+      .catch((cause: unknown) => {
+        bb.log.warn(
+          `${ENGINE_LABELS[engine]} download failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+        bb.realtime.publish(ENGINE_READY, { engine, failed: true });
+        return null;
+      })
+      .finally(() => {
+        downloads.delete(engine);
+      });
+    downloads.set(engine, job);
+  }
+
+  // --------------------------------------------------------- engine resolving
+
+  function customPath(config: Config, engine: EngineId): string | null {
+    const value = config[ENGINE_SETTING_KEYS[engine]];
+    if (value.length === 0) return null;
+    return existsSync(value) ? value : null;
+  }
+
+  async function resolveEngine(engine: EngineId, config: Config): Promise<EngineState> {
+    const custom = customPath(config, engine);
+    const downloading = downloads.has(engine);
+    if (engine === "graphviz") {
+      if (custom) {
+        return {
+          id: engine,
+          available: true,
+          detail: custom,
+          source: "custom",
+          path: custom,
+          canInstall: false,
+          canRemove: false,
+          downloading,
+        };
+      }
+      const dot = await findExecutable("dot");
+      if (dot) {
+        return {
+          id: engine,
+          available: true,
+          detail: dot,
+          source: "path",
+          path: dot,
+          canInstall: false,
+          canRemove: false,
+          downloading,
+        };
+      }
+      return {
+        id: engine,
+        available: true,
+        detail: "bundled WASM renderer",
+        source: "bundled",
+        path: null,
+        canInstall: false,
+        canRemove: false,
+        downloading,
+      };
+    }
+    const downloaded = engine === "plantuml" ? plantumlBinary() : d2Binary();
+    if (custom) {
+      return {
+        id: engine,
+        available: true,
+        detail: custom,
+        source: "custom",
+        path: custom,
+        canInstall: false,
+        canRemove: downloaded !== null,
+        downloading,
+      };
+    }
+    if (downloaded) {
+      return {
+        id: engine,
+        available: true,
+        detail: "installed by this plugin",
+        source: "downloaded",
+        path: downloaded,
+        canInstall: false,
+        canRemove: true,
+        downloading,
+      };
+    }
+    const found = await findExecutable(engine);
+    if (found) {
+      return {
+        id: engine,
+        available: true,
+        detail: found,
+        source: "path",
+        path: found,
+        canInstall: true,
+        canRemove: false,
+        downloading,
+      };
+    }
+    return {
+      id: engine,
+      available: false,
+      detail: downloading ? "downloading…" : "not installed — diagrams use Kroki",
+      source: null,
+      path: null,
+      canInstall: !downloading && Boolean((engine === "plantuml" ? PLANTUML_ASSETS : D2_ASSETS)[`${process.platform}-${process.arch}`]),
+      canRemove: false,
+      downloading,
+    };
+  }
+
+  // ---------------------------------------------------------------- renderers
+
+  async function renderGraphviz(source: string, theme: Theme, config: Config): Promise<{ svg: string; engine: string }> {
+    const dot = customPath(config, "graphviz") ?? (await findExecutable("dot"));
     if (dot) {
       const svg = await runProcess(dot, ["-Tsvg"], source);
       return { svg: theme === "dark" ? recolorGraphviz(svg) : svg, engine: "graphviz-dot" };
@@ -325,95 +627,7 @@ export default async function plugin(bb: BbPluginApi) {
     return { svg: theme === "dark" ? recolorGraphviz(svg) : svg, engine: "graphviz-wasm" };
   }
 
-  let plantumlDownload: Promise<string | null> | null = null;
-  let plantumlPath: string | null = null;
-
-  function engineDirectory(): string {
-    // <dataDir>/plugins/<id>/ is this plugin's own directory (data.db lives there).
-    return path.join(
-      bb.server.experimental_dataDir,
-      "plugins",
-      bb.pluginId,
-      "engines",
-      `plantuml-${PLANTUML_VERSION}`,
-    );
-  }
-
-  function cachedPlantumlBinary(): string | null {
-    if (plantumlPath && existsSync(plantumlPath)) return plantumlPath;
-    const candidate = path.join(
-      engineDirectory(),
-      process.platform === "win32" ? "plantuml.exe" : "plantuml",
-    );
-    if (existsSync(candidate)) {
-      plantumlPath = candidate;
-      return candidate;
-    }
-    return null;
-  }
-
-  async function downloadPlantuml(): Promise<string | null> {
-    const asset = NATIVE_ASSETS[`${process.platform}-${process.arch}`];
-    if (!asset) {
-      bb.log.warn(`no native PlantUML build for ${process.platform}-${process.arch}`);
-      return null;
-    }
-    const directory = engineDirectory();
-    const zipPath = path.join(directory, "plantuml.zip");
-    const url = `https://github.com/plantuml/plantuml/releases/download/v${PLANTUML_VERSION}/${asset}-${PLANTUML_VERSION}.zip`;
-    bb.log.info(`downloading PlantUML ${PLANTUML_VERSION} (${asset})`);
-    await mkdir(directory, { recursive: true });
-    const response = await fetch(url, {
-      redirect: "follow",
-      signal: AbortSignal.timeout(300_000),
-    });
-    if (!response.ok) throw new Error(`PlantUML download failed: HTTP ${response.status}`);
-    await writeFile(zipPath, Buffer.from(await response.arrayBuffer()));
-    try {
-      await runProcess("unzip", ["-o", "-q", zipPath, "-d", directory], "", 120_000);
-    } catch (cause) {
-      // macOS keeps `unzip`, but ditto is the fallback when it is missing.
-      await runProcess("ditto", ["-x", "-k", zipPath, directory], "", 120_000).catch(() => {
-        throw cause;
-      });
-    }
-    const binary = path.join(
-      directory,
-      process.platform === "win32" ? "plantuml.exe" : "plantuml",
-    );
-    await chmod(binary, 0o755);
-    await rm(zipPath, { force: true });
-    plantumlPath = binary;
-    bb.log.info(`PlantUML engine ready at ${binary}`);
-    bb.realtime.publish(ENGINE_READY, { engine: "plantuml" });
-    return binary;
-  }
-
-  function startPlantumlDownload(): void {
-    plantumlDownload ??= downloadPlantuml()
-      .catch((cause: unknown) => {
-        bb.log.warn(
-          `PlantUML download failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-        );
-        plantumlDownload = null;
-        return null;
-      })
-      .finally(() => {
-        plantumlDownload = null;
-      });
-  }
-
-  async function findPlantuml(): Promise<string | null> {
-    const cached = cachedPlantumlBinary();
-    if (cached) return cached;
-    const installed = await findExecutable("plantuml");
-    if (installed) return installed;
-    return null;
-  }
-
-  async function renderPlantuml(source: string, theme: Theme): Promise<{ svg: string; engine: string }> {
-    const binary = await findPlantuml();
-    if (!binary) throw new Error("the PlantUML engine is not available on this machine");
+  async function renderPlantuml(source: string, theme: Theme, binary: string): Promise<{ svg: string; engine: string }> {
     const base = ["-tsvg", "-pipe", "-charset", "UTF-8"];
     try {
       const svg = await runProcess(binary, theme === "dark" ? [...base, "-darkmode"] : base, source);
@@ -426,9 +640,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function renderD2(source: string, theme: Theme): Promise<{ svg: string; engine: string }> {
-    const binary = await findExecutable("d2");
-    if (!binary) throw new Error("the d2 binary is not installed");
+  async function renderD2(source: string, theme: Theme, binary: string): Promise<{ svg: string; engine: string }> {
     const args = ["--layout", "dagre", "-", "--stdout-format", "svg"];
     if (theme === "dark") args.push("--theme", "200");
     const svg = await runProcess(binary, args, source);
@@ -448,6 +660,20 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Kroki HTTP ${response.status}: ${describeKrokiError(body)}`);
     }
     return { svg: await response.text(), engine: "kroki" };
+  }
+
+  async function renderLocal(
+    engine: EngineId,
+    source: string,
+    theme: Theme,
+    config: Config,
+    state: EngineState,
+  ): Promise<{ svg: string; engine: string }> {
+    if (engine === "graphviz") return renderGraphviz(source, theme, config);
+    if (state.path === null) throw new Error(`${ENGINE_LABELS[engine]} is not available`);
+    return engine === "plantuml"
+      ? renderPlantuml(source, theme, state.path)
+      : renderD2(source, theme, state.path);
   }
 
   // ----------------------------------------------------------------- render
@@ -479,33 +705,30 @@ export default async function plugin(bb: BbPluginApi) {
       const local = localEngineFor(language);
       const wantsLocal = config.mode === "auto" || config.mode === "local";
 
-      if (wantsLocal && local === "graphviz") {
-        return renderGraphviz(source, input.theme);
-      }
-      if (wantsLocal && local === "plantuml") {
-        const binary = await findPlantuml();
-        if (binary) return renderPlantuml(source, input.theme);
-        if (config.downloadPlantUml && config.mode !== "local") startPlantumlDownload();
+      if (wantsLocal && local !== null) {
+        const state = await resolveEngine(local, config);
+        if (state.available && (local === "graphviz" || state.path !== null)) {
+          return renderLocal(local, source, input.theme, config, state);
+        }
         if (config.mode === "local") {
-          if (config.downloadPlantUml) {
-            startPlantumlDownload();
+          if (config.autoDownload && local !== "graphviz") {
+            startDownload(local);
             throw new Error(
-              "the PlantUML engine is downloading; the diagram appears on the next message",
+              `${ENGINE_LABELS[local]} is downloading; the diagram appears on the next message`,
             );
           }
-          throw new Error("the PlantUML engine is not installed and downloading is off");
+          throw new Error(
+            `the local ${ENGINE_LABELS[local]} engine is not available — install it from settings, set a custom path, or use Auto / kroki.io`,
+          );
         }
+        if (config.autoDownload && local !== "graphviz") startDownload(local);
       }
-      if (wantsLocal && local === "d2") {
-        const binary = await findExecutable("d2");
-        if (binary) return renderD2(source, input.theme);
-        if (config.mode === "local") throw new Error("the d2 binary is not installed");
-      }
+
       if (config.mode === "local") {
         throw new Error(
           local === null
             ? `no local engine draws ${language}; use Auto or kroki.io`
-            : `the local ${local} engine is not available on this machine`,
+            : `the local ${ENGINE_LABELS[local]} engine is not available`,
         );
       }
       if (!config.krokiUrl) throw new Error("the Kroki URL is empty");
@@ -525,58 +748,81 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function status() {
     const config = await effective();
-    const [dot, plantumlBinary, d2, cached] = await Promise.all([
-      findExecutable("dot"),
-      findPlantuml(),
-      findExecutable("d2"),
-      Promise.resolve(cachedPlantumlBinary()),
-    ]);
+    const engines = await Promise.all(
+      (["graphviz", "plantuml", "d2"] as const).map(async (engine) => {
+        const state = await resolveEngine(engine, config);
+        return {
+          ...state,
+          label: ENGINE_LABELS[engine],
+          custom: config[ENGINE_SETTING_KEYS[engine]],
+        };
+      }),
+    );
     return {
       mode: config.mode,
       krokiUrl: config.krokiUrl,
       cacheEntries: (countCached.get() as { n: number }).n,
-      engines: [
-        {
-          id: "graphviz",
-          label: "Graphviz",
-          available: true,
-          detail: dot ? `dot at ${dot}` : vizPromise ? "WASM" : "WASM (loads on first diagram)",
-        },
-        {
-          id: "plantuml",
-          label: "PlantUML",
-          available: plantumlBinary !== null,
-          detail: cached
-            ? "native engine downloaded"
-            : plantumlBinary
-              ? `plantuml at ${plantumlBinary}`
-              : plantumlDownload
-                ? "downloading…"
-                : config.downloadPlantUml
-                  ? "downloads on first diagram"
-                  : "not installed",
-        },
-        {
-          id: "d2",
-          label: "D2",
-          available: d2 !== null,
-          detail: d2 ? `d2 at ${d2}` : "not installed — D2 goes to Kroki",
-        },
-      ],
+      engines,
     };
   }
+
+  const TEST_SOURCES: Record<EngineId, { language: string; source: string }> = {
+    graphviz: { language: "dot", source: 'digraph G { rankdir=LR; alpha -> beta [label="test"] }' },
+    plantuml: { language: "plantuml", source: "@startuml\nAlice -> Bob: test\n@enduml" },
+    d2: { language: "d2", source: "alpha -> beta: test" },
+  };
 
   bb.rpc.register(rpcContract, {
     render: (input) => render({ ...input, theme: input.theme ?? "light" }),
     status: () => status(),
-    async download_plantuml() {
+    async engine_install({ engine }) {
       const config = await effective();
-      if (!config.downloadPlantUml) throw new Error("downloading is turned off in settings");
-      const existing = cachedPlantumlBinary();
-      if (existing) return { started: false, path: existing };
-      if (plantumlDownload) return { started: false, path: null };
-      startPlantumlDownload();
+      const state = await resolveEngine(engine, config);
+      if (state.available) return { started: false, path: state.path };
+      if (engine === "graphviz") {
+        throw new Error("Graphviz needs no install: the bundled WASM renderer draws it");
+      }
+      if (downloads.has(engine)) return { started: false, path: null };
+      startDownload(engine);
       return { started: true, path: null };
+    },
+    async engine_remove({ engine }) {
+      if (engine === "graphviz") return { removed: false };
+      const home = engine === "plantuml" ? plantumlHome() : d2Home();
+      const existed = existsSync(home);
+      // Only ever delete a directory this plugin created.
+      if (existed) await rm(home, { recursive: true, force: true });
+      bb.realtime.publish(ENGINE_READY, { engine, removed: true });
+      return { removed: existed };
+    },
+    async engine_set_path({ engine, path: value }) {
+      const trimmed = value.trim();
+      if (trimmed.length > 0 && !existsSync(trimmed)) {
+        throw new Error(`nothing exists at ${trimmed}`);
+      }
+      if (trimmed.length > 0) {
+        await chmod(trimmed, 0o755).catch(() => {
+          // A binary that is already executable (or owned by another user) is fine.
+        });
+      }
+      await settings.experimental_set({ [ENGINE_SETTING_KEYS[engine]]: trimmed });
+      bb.realtime.publish(ENGINE_READY, { engine, path: trimmed || null });
+      return { path: trimmed.length > 0 ? trimmed : null };
+    },
+    async engine_test({ engine }) {
+      const config = await effective();
+      const state = await resolveEngine(engine, config);
+      const sample = TEST_SOURCES[engine];
+      try {
+        if (!state.available) {
+          if (engine !== "graphviz") startDownload(engine);
+          throw new Error(`${ENGINE_LABELS[engine]} is not installed`);
+        }
+        const result = await renderLocal(engine, sample.source, "light", config, state);
+        return { ok: true, svg: result.svg };
+      } catch (cause) {
+        return { ok: false, error: cause instanceof Error ? cause.message : String(cause) };
+      }
     },
     clear_cache() {
       const before = (countCached.get() as { n: number }).n;

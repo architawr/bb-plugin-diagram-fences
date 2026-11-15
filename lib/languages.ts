@@ -31,6 +31,9 @@ export const DIAGRAM_LANGUAGES = [
   "umlet",
   "vega",
   "vegalite",
+  "tikz",
+  "goat",
+  "lini",
   "blockdiag",
   "seqdiag",
   "actdiag",
@@ -42,6 +45,7 @@ export const DIAGRAM_LANGUAGES = [
 export type DiagramLanguage = (typeof DIAGRAM_LANGUAGES)[number];
 
 export type DiagramEngine = "graphviz" | "plantuml" | "d2" | "kroki";
+export type LocalDiagramEngine = Exclude<DiagramEngine, "kroki">;
 
 /** Human-facing engine label for the fence header. */
 export const ENGINE_LABELS: Record<string, string> = {
@@ -82,7 +86,7 @@ export function krokiSlug(language: string): string {
 }
 
 /** Which local engine, if any, can draw this language without a server. */
-export function localEngineFor(language: string): DiagramEngine | null {
+export function localEngineFor(language: string): LocalDiagramEngine | null {
   switch (krokiSlug(language)) {
     case "plantuml":
       return "plantuml";

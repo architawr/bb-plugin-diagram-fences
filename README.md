@@ -33,11 +33,20 @@ Settings → Installed plugins → Diagram Fences → **Diagram engines**.
 
 ## Local engines
 
-| Engine | How | Cost |
+Settings → Installed plugins → Diagram Fences → **Diagram engines** installs,
+points and tests each engine:
+
+| Engine | How it is resolved | Cost |
 | --- | --- | --- |
-| Graphviz | `dot` when installed, otherwise the bundled `@viz-js/viz` WASM | ~30 ms, no process |
-| PlantUML | `plantuml` on `PATH`, otherwise a native (GraalVM) binary downloaded once to `<dataDir>/plugins/diagram-fences/engines/` | ~54 MB download, ~0.2 s per diagram, no Java needed |
-| D2 | `d2` when installed on `PATH` | per-diagram process |
+| Graphviz | custom `dot` path → `dot` on `PATH` → bundled `@viz-js/viz` WASM | ~30 ms, no process |
+| PlantUML | custom path → binary installed by the plugin → `plantuml` on `PATH` | ~54 MB once, ~0.2 s per diagram, no Java |
+| D2 | custom path → binary installed by the plugin → `d2` on `PATH` | ~17 MB once, per-diagram process |
+
+Each card shows the resolved path and its origin (custom, installed, on PATH,
+bundled) with **Install**, **Use my own binary…**, **Test** and **Remove**
+actions. `autoDownload` (on by default) fetches a missing PlantUML or D2 build
+the first time a diagram needs one, in the background, while that diagram goes
+to Kroki.
 
 Nothing stays resident: WASM is created on first use, PlantUML and D2 are
 short-lived processes that exit after one render, and every SVG is cached by a
@@ -54,6 +63,8 @@ entry count (400 by default).
   app origin only, JSON only.
 - Diagram sources are sent to kroki.io only in `auto` (when no local engine
   applies), `kroki`, and `custom` modes. `local` never leaves the machine.
+- Installed engines live under this plugin's own data directory and are the
+  only files the plugin ever deletes.
 
 ## Limits
 
