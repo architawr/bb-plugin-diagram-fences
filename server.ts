@@ -198,6 +198,23 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/** Kroki answers a bad diagram with an SVG of the parse error; keep its text. */
+function describeKrokiError(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed.includes("<svg")) {
+    return trimmed.slice(0, 300).replace(/\s+/g, " ");
+  }
+  const text = trimmed
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.slice(0, 300) || "the diagram could not be parsed";
+}
+
 interface CachedDiagram {
   svg: string;
   engine: string;
@@ -427,8 +444,8 @@ export default async function plugin(bb: BbPluginApi) {
       signal: AbortSignal.timeout(KROKI_TIMEOUT_MS),
     });
     if (!response.ok) {
-      const detail = (await response.text()).slice(0, 300).replace(/\s+/g, " ").trim();
-      throw new Error(`Kroki HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+      const body = await response.text();
+      throw new Error(`Kroki HTTP ${response.status}: ${describeKrokiError(body)}`);
     }
     return { svg: await response.text(), engine: "kroki" };
   }
