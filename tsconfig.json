@@ -25,7 +25,6 @@
     "server.ts",
     "app.tsx",
     "components",
-    "lib",
-    "hooks"
+    "lib"
   ]
 }

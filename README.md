@@ -20,6 +20,19 @@ Mermaid is not claimed; BB already draws it.
   code-fence slot does not reach previews, so a content script does it).
 - A broken diagram shows the error and BB's own code block; nothing is hidden.
 
+## Settings
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `mode` | `auto` | Where diagrams are drawn (see below) |
+| `krokiUrl` | `https://kroki.io` | Gateway for `custom` mode |
+| `autoDownload` | on | Fetch a missing PlantUML/D2 build in the background |
+| `graphvizPath` | empty | Custom `dot` binary |
+| `plantumlPath` | empty | Custom `plantuml` binary |
+| `d2Path` | empty | Custom `d2` binary |
+| `cacheEntries` | 400 | Cached SVGs kept on disk |
+| `maxSourceKb` | 64 | Largest accepted diagram source |
+
 ## Modes
 
 Settings → Installed plugins → Diagram Fences → **Diagram engines**.
@@ -48,11 +61,24 @@ actions. `autoDownload` (on by default) fetches a missing PlantUML or D2 build
 the first time a diagram needs one, in the background, while that diagram goes
 to Kroki.
 
-Nothing stays resident: WASM is created on first use, PlantUML and D2 are
-short-lived processes that exit after one render, and every SVG is cached by a
-hash of (language, theme, source) in the plugin's SQLite database, so the same
-diagram is drawn once per machine. The cache is trimmed to the configured
-entry count (400 by default).
+## Cost
+
+Nothing stays resident and nothing polls:
+
+- **No daemons.** PlantUML and D2 are short-lived processes that exit after one
+  render; Graphviz WASM is created on first use and left to the GC.
+- **Two processes at a time.** A message with eight diagrams queues instead of
+  spawning eight engine runs; the rest wait a few hundred milliseconds.
+- **Single flight.** Identical diagrams in one message share one render, on the
+  server (`inFlight`) and in the page.
+- **Cached everywhere.** The server keeps SVG by `(language, theme, source)` in
+  SQLite, trimmed to `cacheEntries`; the chat and the preview panel keep an
+  in-memory LRU, so scrolling back, switching tabs or flipping the theme back
+  does not hit the server at all.
+- **Lazy previews.** A fence is drawn when it comes within 300 px of the
+  viewport, so opening a 60-diagram file renders only what you look at.
+- **Narrow observation.** The preview script only reacts to DOM changes inside
+  a preview panel, and re-renders of the surrounding app cost nothing.
 
 ## Security
 

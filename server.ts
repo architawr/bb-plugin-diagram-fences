@@ -212,6 +212,26 @@ function runProcess(
   });
 }
 
+/**
+ * Local engines are processes. A message with eight diagrams would otherwise
+ * spawn eight PlantUML runs at once; two at a time keeps the machine quiet.
+ */
+const PROCESS_LIMIT = 2;
+let activeProcesses = 0;
+const processQueue: Array<() => void> = [];
+async function withProcessSlot<T>(task: () => Promise<T>): Promise<T> {
+  if (activeProcesses >= PROCESS_LIMIT) {
+    await new Promise<void>((resolve) => processQueue.push(resolve));
+  }
+  activeProcesses += 1;
+  try {
+    return await task();
+  } finally {
+    activeProcesses -= 1;
+    processQueue.shift()?.();
+  }
+}
+
 /** `which`, cached: engine probes must not shell out on every render. */
 const executableCache = new Map<string, string | null>();
 async function findExecutable(name: string): Promise<string | null> {
@@ -518,14 +538,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   // --------------------------------------------------------- engine resolving
 
+  function customSetting(config: Config, engine: EngineId): string {
+    return config[ENGINE_SETTING_KEYS[engine]];
+  }
+
   function customPath(config: Config, engine: EngineId): string | null {
-    const value = config[ENGINE_SETTING_KEYS[engine]];
-    if (value.length === 0) return null;
-    return existsSync(value) ? value : null;
+    const value = customSetting(config, engine);
+    return value.length > 0 && existsSync(value) ? value : null;
   }
 
   async function resolveEngine(engine: EngineId, config: Config): Promise<EngineState> {
     const custom = customPath(config, engine);
+    const customValue = customSetting(config, engine);
+    const customMissing = customValue.length > 0 && custom === null;
+    const missingDetail = customMissing
+      ? `custom path not found: ${customValue}`
+      : "not installed — diagrams use Kroki";
     const downloading = downloads.has(engine);
     if (engine === "graphviz") {
       if (custom) {
@@ -556,7 +584,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         id: engine,
         available: true,
-        detail: "bundled WASM renderer",
+        detail: customMissing ? `bundled WASM renderer (${missingDetail})` : "bundled WASM renderer",
         source: "bundled",
         path: null,
         canInstall: false,
@@ -581,7 +609,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         id: engine,
         available: true,
-        detail: "installed by this plugin",
+        detail: customMissing ? `installed by this plugin (${missingDetail})` : "installed by this plugin",
         source: "downloaded",
         path: downloaded,
         canInstall: false,
@@ -594,7 +622,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         id: engine,
         available: true,
-        detail: found,
+        detail: customMissing ? `${found} (${missingDetail})` : found,
         source: "path",
         path: found,
         canInstall: true,
@@ -605,7 +633,7 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       id: engine,
       available: false,
-      detail: downloading ? "downloading…" : "not installed — diagrams use Kroki",
+      detail: downloading ? "downloading…" : missingDetail,
       source: null,
       path: null,
       canInstall: !downloading && Boolean((engine === "plantuml" ? PLANTUML_ASSETS : D2_ASSETS)[`${process.platform}-${process.arch}`]),
@@ -619,7 +647,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function renderGraphviz(source: string, theme: Theme, config: Config): Promise<{ svg: string; engine: string }> {
     const dot = customPath(config, "graphviz") ?? (await findExecutable("dot"));
     if (dot) {
-      const svg = await runProcess(dot, ["-Tsvg"], source);
+      const svg = await withProcessSlot(() => runProcess(dot, ["-Tsvg"], source));
       return { svg: theme === "dark" ? recolorGraphviz(svg) : svg, engine: "graphviz-dot" };
     }
     const viz = await vizInstance();
@@ -630,12 +658,14 @@ export default async function plugin(bb: BbPluginApi) {
   async function renderPlantuml(source: string, theme: Theme, binary: string): Promise<{ svg: string; engine: string }> {
     const base = ["-tsvg", "-pipe", "-charset", "UTF-8"];
     try {
-      const svg = await runProcess(binary, theme === "dark" ? [...base, "-darkmode"] : base, source);
+      const svg = await withProcessSlot(() =>
+        runProcess(binary, theme === "dark" ? [...base, "-darkmode"] : base, source),
+      );
       return { svg, engine: "plantuml" };
     } catch (cause) {
       if (theme !== "dark") throw cause;
       // Older builds do not know -darkmode; a light diagram beats no diagram.
-      const svg = await runProcess(binary, base, source);
+      const svg = await withProcessSlot(() => runProcess(binary, base, source));
       return { svg, engine: "plantuml" };
     }
   }
@@ -643,7 +673,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function renderD2(source: string, theme: Theme, binary: string): Promise<{ svg: string; engine: string }> {
     const args = ["--layout", "dagre", "-", "--stdout-format", "svg"];
     if (theme === "dark") args.push("--theme", "200");
-    const svg = await runProcess(binary, args, source);
+    const svg = await withProcessSlot(() => runProcess(binary, args, source));
     return { svg, engine: "d2" };
   }
 
@@ -799,11 +829,6 @@ export default async function plugin(bb: BbPluginApi) {
       const trimmed = value.trim();
       if (trimmed.length > 0 && !existsSync(trimmed)) {
         throw new Error(`nothing exists at ${trimmed}`);
-      }
-      if (trimmed.length > 0) {
-        await chmod(trimmed, 0o755).catch(() => {
-          // A binary that is already executable (or owned by another user) is fine.
-        });
       }
       await settings.experimental_set({ [ENGINE_SETTING_KEYS[engine]]: trimmed });
       bb.realtime.publish(ENGINE_READY, { engine, path: trimmed || null });

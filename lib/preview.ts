@@ -6,13 +6,22 @@
  * diagram code block, and inserts the SVG our server draws next to it. It never
  * edits React-owned children: it only adds attributes and one sibling <figure>,
  * so a re-render of the preview is harmless — the observer simply draws again.
+ *
+ * Cost control:
+ *   - only mutations inside a preview panel schedule a scan;
+ *   - a diagram is fetched when it is within 300 px of the viewport, never for
+ *     a preview that is hidden or scrolled far away;
+ *   - rendered SVG and in-flight requests are kept per key, so a re-render,
+ *     a tab switch or a theme flip back does not ask the server again.
  */
+import { fingerprint } from "./hash";
 import { isDiagramLanguage, normalizeLanguage } from "./languages";
 
 const FIGURE_ATTR = "data-bb-diagram-figure";
 const CARD_ATTR = "data-bb-diagram-card";
 const STYLE_ID = "bb-diagram-fences-style";
 const PREVIEW_ROOT = "[data-file-preview-scroll-container]";
+const CACHE_LIMIT = 60;
 
 const STYLE = `
 ${PREVIEW_ROOT} [${CARD_ATTR}] { display: none !important; }
@@ -55,38 +64,74 @@ function isDark(): boolean {
   return document.documentElement.classList.contains("dark");
 }
 
-/** Small non-cryptographic hash: only used to notice a stale rendered figure. */
-function fingerprint(value: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(36);
-}
-
 function languageOf(code: Element): string | null {
   for (const className of code.classList) {
     if (!className.startsWith("language-")) continue;
     const language = normalizeLanguage(className.slice("language-".length));
-    if (isDiagramLanguage(language)) return language;
-    return null;
+    return isDiagramLanguage(language) ? language : null;
   }
   return null;
 }
 
 export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () => void {
   const endpoint = `/api/v1/plugins/${pluginId}/http/render`;
+
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = STYLE;
   document.head.append(style);
 
+  const svgCache = new Map<string, string>();
+  const inFlight = new Map<string, Promise<string>>();
   const objectUrls = new Set<string>();
   const figures = new Set<HTMLElement>();
   const cards = new Set<HTMLElement>();
+  const watched = new WeakSet<HTMLElement>();
   let timer: number | null = null;
   let disposed = false;
+
+  function remember(key: string, svg: string) {
+    svgCache.delete(key);
+    svgCache.set(key, svg);
+    while (svgCache.size > CACHE_LIMIT) {
+      const oldest = svgCache.keys().next().value;
+      if (oldest === undefined) break;
+      svgCache.delete(oldest);
+    }
+  }
+
+  async function svgFor(
+    key: string,
+    language: string,
+    source: string,
+    theme: string,
+  ): Promise<string> {
+    const cached = svgCache.get(key);
+    if (cached !== undefined) {
+      remember(key, cached);
+      return cached;
+    }
+    const pending = inFlight.get(key);
+    if (pending !== undefined) return pending;
+    const job = (async () => {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ language, source, theme }),
+        signal,
+      });
+      const payload = (await response.json()) as
+        | { ok: true; svg: string }
+        | { ok: false; error?: string };
+      if (!payload.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
+      remember(key, payload.svg);
+      return payload.svg;
+    })().finally(() => {
+      inFlight.delete(key);
+    });
+    inFlight.set(key, job);
+    return job;
+  }
 
   function hideCard(card: HTMLElement) {
     if (card === document.body) return;
@@ -137,7 +182,7 @@ export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () 
 
     const status = document.createElement("div");
     status.className = "bb-diagram-figure-status";
-    status.textContent = "Rendering diagram…";
+    status.textContent = svgCache.has(key) ? "Drawing…" : "Rendering diagram…";
 
     const image = document.createElement("img");
     image.className = "bb-diagram-figure-image";
@@ -150,18 +195,9 @@ export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () 
     if (card !== null) hideCard(card);
 
     try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ language, source, theme }),
-        signal,
-      });
-      const payload = (await response.json()) as
-        | { ok: true; svg: string }
-        | { ok: false; error?: string };
-      if (!payload.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
-      if (disposed) return;
-      const url = URL.createObjectURL(new Blob([payload.svg], { type: "image/svg+xml" }));
+      const svg = await svgFor(key, language, source, theme);
+      if (disposed || !figure.isConnected) return;
+      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
       objectUrls.add(url);
       image.src = url;
       status.remove();
@@ -170,8 +206,8 @@ export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () 
       figure.remove();
       figures.delete(figure);
       if (card !== null) showCard(card);
-      const message = cause instanceof Error ? cause.message : String(cause);
       if (signal.aborted) return;
+      const message = cause instanceof Error ? cause.message : String(cause);
       // Leave BB's own code block in place; only note why nothing was drawn.
       const note = document.createElement("div");
       note.className = "bb-diagram-figure-error";
@@ -181,16 +217,27 @@ export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () 
     }
   }
 
+  /** Fetch only when the fence is close to the viewport. */
+  const lazy = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const pre = entry.target as HTMLElement;
+        lazy.unobserve(pre);
+        void draw(pre);
+      }
+    },
+    { rootMargin: "300px 0px" },
+  );
+
   function scan() {
     if (disposed) return;
     for (const root of document.querySelectorAll<HTMLElement>(PREVIEW_ROOT)) {
       for (const pre of root.querySelectorAll<HTMLElement>("pre")) {
-        const previous = pre.previousElementSibling;
-        void draw(pre).catch(() => {
-          if (previous instanceof HTMLElement && previous.hasAttribute(FIGURE_ATTR)) {
-            previous.remove();
-          }
-        });
+        if (watched.has(pre)) continue;
+        watched.add(pre);
+        if (languageOf(pre.firstElementChild ?? pre) === null) continue;
+        lazy.observe(pre);
       }
     }
   }
@@ -203,14 +250,27 @@ export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () 
     }, 120);
   }
 
+  function touchesPreview(record: MutationRecord): boolean {
+    const target = record.target;
+    if (target instanceof Element && target.closest(PREVIEW_ROOT) !== null) return true;
+    for (const node of record.addedNodes) {
+      if (!(node instanceof Element)) continue;
+      if (
+        node.matches(PREVIEW_ROOT) ||
+        node.querySelector(PREVIEW_ROOT) !== null ||
+        node.closest(PREVIEW_ROOT) !== null
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   const observer = new MutationObserver((records) => {
     for (const record of records) {
-      for (const node of record.addedNodes) {
-        if (!(node instanceof HTMLElement)) continue;
-        if (node.matches("pre") || node.querySelector("pre") !== null) {
-          schedule();
-          return;
-        }
+      if (touchesPreview(record)) {
+        schedule();
+        return;
       }
     }
   });
@@ -229,12 +289,15 @@ export function mountPreviewDiagrams(pluginId: string, signal: AbortSignal): () 
     if (timer !== null) window.clearTimeout(timer);
     observer.disconnect();
     themeObserver.disconnect();
+    lazy.disconnect();
     for (const figure of figures) figure.remove();
     for (const card of cards) card.removeAttribute(CARD_ATTR);
     for (const url of objectUrls) URL.revokeObjectURL(url);
     figures.clear();
     cards.clear();
     objectUrls.clear();
+    svgCache.clear();
+    inFlight.clear();
     style.remove();
   };
 }

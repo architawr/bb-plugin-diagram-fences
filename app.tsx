@@ -10,9 +10,11 @@ import {
   definePluginApp,
   useRealtime,
   useRpc,
+  useSettings,
   type ExperimentalCodeFenceRendererProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { fingerprint } from "./lib/hash";
 import { DIAGRAM_LANGUAGES } from "./lib/languages";
 import { mountPreviewDiagrams } from "./lib/preview";
 import { Button } from "@/components/ui/button";
@@ -108,6 +110,24 @@ function ToolbarButton({
   );
 }
 
+type CachedRender = { svg: string; engine: string };
+const RENDER_CACHE_LIMIT = 80;
+const renderCache = new Map<string, CachedRender>();
+
+function renderKey(mode: string, language: string, theme: string, source: string): string {
+  return `${mode}|${language}|${theme}|${source.length}|${fingerprint(source)}`;
+}
+
+function rememberRender(key: string, value: CachedRender) {
+  renderCache.delete(key);
+  renderCache.set(key, value);
+  while (renderCache.size > RENDER_CACHE_LIMIT) {
+    const oldest = renderCache.keys().next().value;
+    if (oldest === undefined) break;
+    renderCache.delete(oldest);
+  }
+}
+
 function DiagramBlock({
   language,
   source,
@@ -119,20 +139,38 @@ function DiagramBlock({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const dark = useDarkMode();
-  const [state, setState] = useState<RenderState>({ kind: "loading" });
+  const settingValues = useSettings().values;
+  const mode = typeof settingValues?.mode === "string" ? settingValues.mode : "auto";
+  const theme = dark ? "dark" : "light";
+  const key = renderKey(mode, language, theme, source);
+  const [state, setState] = useState<RenderState>(() => {
+    const hit = renderCache.get(key);
+    return hit === undefined
+      ? { kind: "loading" }
+      : { kind: "ready", svg: hit.svg, engine: hit.engine, cached: true };
+  });
   const [attempt, setAttempt] = useState(0);
   const [showSource, setShowSource] = useState(false);
   const [copied, setCopied] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
 
-  // An engine may finish downloading in the background; redraw once it is ready.
-  useRealtime("engine-ready", () => setAttempt((value) => value + 1));
+  // An engine or a path may change in the background; drop cached SVGs and redraw.
+  useRealtime("engine-ready", () => {
+    renderCache.clear();
+    setAttempt((value) => value + 1);
+  });
 
   useEffect(() => {
+    const hit = renderCache.get(key);
+    if (hit !== undefined) {
+      setState({ kind: "ready", svg: hit.svg, engine: hit.engine, cached: true });
+      return;
+    }
     let cancelled = false;
     setState({ kind: "loading" });
-    rpc.call("render", { language, source, theme: dark ? "dark" : "light" }).then(
+    rpc.call("render", { language, source, theme }).then(
       (result) => {
+        rememberRender(key, { svg: result.svg, engine: result.engine });
         if (!cancelled) {
           setState({
             kind: "ready",
@@ -154,7 +192,7 @@ function DiagramBlock({
     return () => {
       cancelled = true;
     };
-  }, [rpc, language, source, dark, attempt]);
+  }, [rpc, key, attempt, language, source, theme]);
 
   useEffect(() => {
     if (state.kind !== "ready") {
